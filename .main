@@ -1,0 +1,312 @@
+const fs = require("fs");
+const path = require("path");
+
+loadEnv(path.join(__dirname, ".env"));
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const OWNER_ID = Number(process.env.OWNER_ID || 0);
+const BOT_NAME = process.env.BOT_NAME || "Live Support Bot";
+const WELCOME_TEXT =
+  process.env.WELCOME_TEXT ||
+  "Welcome. Send your message here and the owner will receive it privately.";
+const TELEGRAM_BASE = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : "";
+
+let updateOffset = 0;
+let botProfile = null;
+
+const statePath = path.join(__dirname, "data.json");
+const state = loadState(statePath);
+
+if (!BOT_TOKEN || !OWNER_ID) {
+  console.error("Missing BOT_TOKEN or OWNER_ID in .env");
+  process.exit(1);
+}
+
+async function main() {
+  botProfile = (await telegram("getMe")).result;
+  console.log(`Template started as @${botProfile.username || "unknown_bot"}`);
+
+  while (true) {
+    try {
+      const response = await telegram("getUpdates", {
+        offset: updateOffset,
+        timeout: 30,
+        allowed_updates: ["message"]
+      });
+
+      for (const update of response.result || []) {
+        updateOffset = update.update_id + 1;
+        await handleUpdate(update);
+      }
+    } catch (error) {
+      console.error(`[polling] ${error.message}`);
+      await sleep(2500);
+    }
+  }
+}
+
+async function handleUpdate(update) {
+  const message = update.message;
+  if (!message) {
+    return;
+  }
+
+  if (message.from?.id === OWNER_ID) {
+    await handleOwnerMessage(message);
+    return;
+  }
+
+  await handleUserMessage(message);
+}
+
+async function handleUserMessage(message) {
+  const from = message.from;
+  if (!from || !message.chat) {
+    return;
+  }
+
+  if (state.bannedUsers[from.id]) {
+    return;
+  }
+
+  if ((message.text || "").trim().match(/^\/start(?:@\w+)?$/i)) {
+    await sendMessage(message.chat.id, buildWelcome(from.first_name || "friend"));
+    return;
+  }
+
+  registerUser(from);
+  await forwardToOwner(message);
+}
+
+async function handleOwnerMessage(message) {
+  const text = (message.text || "").trim();
+
+  if (/^\/start(?:@\w+)?$/i.test(text) || /^\/help(?:@\w+)?$/i.test(text)) {
+    await sendMessage(OWNER_ID, buildOwnerHelp());
+    return;
+  }
+
+  if (/^\/stats(?:@\w+)?$/i.test(text)) {
+    await sendMessage(OWNER_ID, buildStats());
+    return;
+  }
+
+  const banMatch = text.match(/^\/ban(?:@\w+)?\s+(\d+)$/i);
+  if (banMatch) {
+    state.bannedUsers[banMatch[1]] = true;
+    saveState();
+    await sendMessage(OWNER_ID, `<b>Banned:</b> <code>${banMatch[1]}</code>`);
+    return;
+  }
+
+  const unbanMatch = text.match(/^\/unban(?:@\w+)?\s+(\d+)$/i);
+  if (unbanMatch) {
+    delete state.bannedUsers[unbanMatch[1]];
+    saveState();
+    await sendMessage(OWNER_ID, `<b>Unbanned:</b> <code>${unbanMatch[1]}</code>`);
+    return;
+  }
+
+  const targetId = getReplyTargetUserId(message);
+  if (!targetId) {
+    return;
+  }
+
+  await relayOwnerReply(message, targetId);
+}
+
+function registerUser(user) {
+  state.users[user.id] = {
+    id: user.id,
+    first_name: user.first_name || "",
+    username: user.username || "",
+    last_seen_at: new Date().toISOString()
+  };
+  saveState();
+}
+
+async function forwardToOwner(message) {
+  const user = message.from;
+  const header = [
+    `â•”â• âœ¦ <b>New Inbox Message</b> âœ¦ â•â•—`,
+    `ðŸ†” <b>User ID:</b> <code>${user.id}</code>`,
+    `ðŸ‘¤ <b>Name:</b> ${escapeHtml(user.first_name || "Unknown")}`,
+    `ðŸ”— <b>Username:</b> ${user.username ? `@${escapeHtml(user.username)}` : "not set"}`,
+    "",
+    `â†©ï¸ <i>Reply to this message to answer the user.</i>`
+  ].join("\n");
+
+  await sendMessage(OWNER_ID, header);
+
+  if (message.text) {
+    const sent = await sendMessage(OWNER_ID, `<b>Message</b>\n${escapeHtml(message.text)}`);
+    rememberRelay(sent.result.message_id, user.id);
+    return;
+  }
+
+  const method = pickCopyMethod(message);
+  if (!method) {
+    const sent = await sendMessage(OWNER_ID, `<b>Unsupported content received.</b>`);
+    rememberRelay(sent.result.message_id, user.id);
+    return;
+  }
+
+  const sent = await telegram(method, {
+    chat_id: OWNER_ID,
+    from_chat_id: message.chat.id,
+    message_id: message.message_id
+  });
+  rememberRelay(sent.result.message_id, user.id);
+}
+
+function pickCopyMethod(message) {
+  if (message.photo || message.video || message.document || message.audio || message.voice) {
+    return "copyMessage";
+  }
+  if (message.sticker) {
+    return "copyMessage";
+  }
+  return "";
+}
+
+function rememberRelay(ownerMessageId, userId) {
+  state.replyMap[String(ownerMessageId)] = userId;
+  saveState();
+}
+
+function getReplyTargetUserId(message) {
+  const replyId = message.reply_to_message?.message_id;
+  if (!replyId) {
+    return 0;
+  }
+  return Number(state.replyMap[String(replyId)] || 0);
+}
+
+async function relayOwnerReply(message, userId) {
+  if (message.text) {
+    await sendMessage(userId, escapeHtml(message.text));
+    return;
+  }
+
+  const method = pickCopyMethod(message);
+  if (!method) {
+    await sendMessage(OWNER_ID, `<b>Reply failed.</b>\nUnsupported reply type.`);
+    return;
+  }
+
+  await telegram(method, {
+    chat_id: userId,
+    from_chat_id: OWNER_ID,
+    message_id: message.message_id
+  });
+}
+
+function buildWelcome(firstName) {
+  return [
+    `â•”â• âœ¦ <b>${escapeHtml(BOT_NAME)}</b> âœ¦ â•â•—`,
+    "",
+    `ðŸ‘‹ <b>Welcome ${escapeHtml(firstName)}</b>`,
+    `${escapeHtml(WELCOME_TEXT)}`,
+    "",
+    `â•šâ• <i>Your message will go to the owner privately.</i> â•â•`
+  ].join("\n");
+}
+
+function buildOwnerHelp() {
+  return [
+    `â•”â• âœ¦ <b>Owner Panel</b> âœ¦ â•â•—`,
+    "",
+    `â€¢ Reply to any forwarded user message to answer`,
+    `â€¢ /stats`,
+    `â€¢ /ban <user_id>`,
+    `â€¢ /unban <user_id>`,
+    "",
+    `â•šâ• <i>${escapeHtml(BOT_NAME)} is listening.</i> â•â•`
+  ].join("\n");
+}
+
+function buildStats() {
+  return [
+    `<b>Total users:</b> <code>${Object.keys(state.users).length}</code>`,
+    `<b>Banned users:</b> <code>${Object.keys(state.bannedUsers).length}</code>`
+  ].join("\n");
+}
+
+async function sendMessage(chatId, html, extra = {}) {
+  return telegram("sendMessage", {
+    chat_id: chatId,
+    text: html,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...extra
+  });
+}
+
+async function telegram(method, params = {}) {
+  const response = await fetch(`${TELEGRAM_BASE}/${method}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(params)
+  });
+
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.description || `Telegram ${method} failed`);
+  }
+  return payload;
+}
+
+function loadEnv(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+  const content = fs.readFileSync(filePath, "utf8");
+  for (const line of content.split(/\r?\n/)) {
+    if (!line || line.trim().startsWith("#")) {
+      continue;
+    }
+    const index = line.indexOf("=");
+    if (index === -1) {
+      continue;
+    }
+    const key = line.slice(0, index).trim();
+    const value = line.slice(index + 1).trim();
+    if (key && !process.env[key]) {
+      process.env[key] = value;
+    }
+  }
+}
+
+function loadState(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return { users: {}, bannedUsers: {}, replyMap: {} };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return { users: {}, bannedUsers: {}, replyMap: {} };
+  }
+}
+
+function saveState() {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
